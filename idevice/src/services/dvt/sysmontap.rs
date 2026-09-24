@@ -1,5 +1,7 @@
 //! Sysmontap service - System monitoring tap for processes and system stats
 
+use std::collections::VecDeque;
+
 use plist::{Dictionary, Value};
 
 use super::message::AuxValue;
@@ -42,6 +44,8 @@ pub struct SysmontapSample {
 #[derive(Debug)]
 pub struct SysmontapClient<'a, R: ReadWrite> {
     channel: Channel<'a, R>,
+    /// Rows from the last pushed array that have not been returned yet
+    pending: VecDeque<Dictionary>,
 }
 
 impl<'a, R: ReadWrite> SysmontapClient<'a, R> {
@@ -49,7 +53,10 @@ impl<'a, R: ReadWrite> SysmontapClient<'a, R> {
         let channel = client
             .make_channel(obf!("com.apple.instruments.server.services.sysmontap"))
             .await?;
-        Ok(Self { channel })
+        Ok(Self {
+            channel,
+            pending: VecDeque::new(),
+        })
     }
 
     /// Sends the configuration to the device. No reply expected.
@@ -115,9 +122,14 @@ impl<'a, R: ReadWrite> SysmontapClient<'a, R> {
     }
 
     /// Reads the next sysmontap data row.
-    /// The device pushes arrays of row dicts; we iterate until we find one with data.
+    /// The device pushes arrays of row dicts (typically a system row and a
+    /// process row together); every data row is returned, one per call.
     pub async fn next_sample(&mut self) -> Result<SysmontapSample, IdeviceError> {
         loop {
+            if let Some(dict) = self.pending.pop_front() {
+                return Ok(parse_sample_dict(dict));
+            }
+
             let msg = self.channel.read_message().await?;
             let Some(decoded) = msg.data else { continue };
 
@@ -128,15 +140,13 @@ impl<'a, R: ReadWrite> SysmontapClient<'a, R> {
                 _ => continue,
             };
 
-            for row in rows {
-                if let Some(dict) = row.into_dictionary()
-                    && (dict.contains_key("Processes")
+            self.pending.extend(rows.into_iter().filter_map(|row| {
+                row.into_dictionary().filter(|dict| {
+                    dict.contains_key("Processes")
                         || dict.contains_key("System")
-                        || dict.contains_key("SystemCPUUsage"))
-                {
-                    return Ok(parse_sample_dict(dict));
-                }
-            }
+                        || dict.contains_key("SystemCPUUsage")
+                })
+            }));
         }
     }
 }
