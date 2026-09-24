@@ -312,8 +312,9 @@ impl<R: ReadWrite> RemoteServerClient<R> {
         }
     }
 
-    /// Returns the peer capabilities received during `_notifyOfPublishedCapabilities:`.
-    pub(crate) async fn supported_identifiers(&self) -> Option<Dictionary> {
+    /// Returns the peer capabilities received during `_notifyOfPublishedCapabilities:`:
+    /// every DTX channel identifier the device serves, with its version.
+    pub async fn supported_identifiers(&self) -> Option<Dictionary> {
         match &*self.shared.supported_identifiers.lock().await {
             CapabilityHandshakeState::Received(dict) => Some(dict.clone()),
             CapabilityHandshakeState::Pending | CapabilityHandshakeState::Skipped => None,
