@@ -338,7 +338,7 @@ impl OsTraceRelayReceiver {
             None
         };
 
-        let timestamp = match DateTime::from_timestamp(seconds as i64, microseconds) {
+        let timestamp = match DateTime::from_timestamp(seconds as i64, microseconds * 1_000) {
             Some(t) => t.naive_local(),
             None => {
                 return Err(IdeviceError::UnexpectedResponse(
