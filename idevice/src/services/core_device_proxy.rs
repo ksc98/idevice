@@ -85,10 +85,13 @@ impl CoreDeviceProxy {
         // The inner stream is Box<dyn crate::ReadWrite> but jktcp wants Box<dyn jktcp::ReadWrite>.
         // Both traits have the same bounds, and IdeviceSocket implements both.
         // Re-box through the jktcp trait.
-        let mtu = self.tunnel.info.mtu as usize;
+        // The MSS stays at jktcp's default (IPv6 minimum MTU minus headers)
+        // rather than following the tunnel's reported MTU (16000): over USB,
+        // iOS silently drops some valid outbound segments of 8-9 KB and every
+        // retransmission of them, so a request of more than a few KB (a DTX
+        // call with a long argument list) stalls its connection forever.
         let stream: Box<dyn crate::ReadWrite> = self.tunnel.into_inner();
-        let mut adapter = crate::tcp::adapter::Adapter::new(Box::new(stream), our_ip, their_ip);
-        adapter.set_mss(mtu.saturating_sub(60));
+        let adapter = crate::tcp::adapter::Adapter::new(Box::new(stream), our_ip, their_ip);
         Ok(adapter)
     }
 }
