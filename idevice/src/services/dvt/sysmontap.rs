@@ -38,6 +38,10 @@ pub struct SysmontapSample {
     pub system: Option<Vec<Value>>,
     /// CPU usage summary
     pub system_cpu_usage: Option<Dictionary>,
+    /// Per-core CPU usage, one dictionary per core (same keys as `system_cpu_usage`)
+    pub per_cpu_usage: Option<Vec<Dictionary>>,
+    /// Number of CPU cores
+    pub cpu_count: Option<u64>,
 }
 
 /// Client for system monitoring tap
@@ -161,9 +165,21 @@ fn parse_sample_dict(dict: Dictionary) -> SysmontapSample {
         .get("SystemCPUUsage")
         .and_then(|v| v.as_dictionary())
         .cloned();
+    let per_cpu_usage = dict
+        .get("PerCPUUsage")
+        .and_then(|v| v.as_array())
+        .map(|cores| {
+            cores
+                .iter()
+                .filter_map(|c| c.as_dictionary().cloned())
+                .collect()
+        });
+    let cpu_count = dict.get("CPUCount").and_then(|v| v.as_unsigned_integer());
     SysmontapSample {
         processes,
         system,
         system_cpu_usage,
+        per_cpu_usage,
+        cpu_count,
     }
 }
