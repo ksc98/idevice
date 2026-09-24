@@ -859,8 +859,9 @@ impl<R: ReadWrite> RemoteServerClient<R> {
         R: 'static,
     {
         let fut = async move {
+            let mut fragments = super::message::Fragments::default();
             loop {
-                match Message::from_reader(&mut reader).await {
+                match Message::from_reader_with(&mut reader, &mut fragments).await {
                     Ok(msg) => {
                         debug!("[{}] Read message: {msg:#?}", label);
                         if Self::dispatch_pending_reply(&shared, msg.clone()).await {
