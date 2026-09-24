@@ -32,6 +32,12 @@ pub struct GraphicsSample {
     pub gpu_bundle_name: String,
     /// GPU recovery count
     pub recovery_count: u64,
+    /// Overall GPU utilization, percent
+    pub device_utilization: f64,
+    /// Renderer utilization, percent
+    pub renderer_utilization: f64,
+    /// Tiler utilization, percent
+    pub tiler_utilization: f64,
 }
 
 impl GraphicsSample {
@@ -62,6 +68,9 @@ impl GraphicsSample {
                 .unwrap_or("")
                 .to_string(),
             recovery_count: get_u64(&dict, "recoveryCount"),
+            device_utilization: get_f64(&dict, "Device Utilization %"),
+            renderer_utilization: get_f64(&dict, "Renderer Utilization %"),
+            tiler_utilization: get_f64(&dict, "Tiler Utilization %"),
         })
     }
 }
