@@ -27,6 +27,23 @@ impl IdeviceService for OsTraceRelayClient {
     }
 }
 
+/// `os_activity_stream_flag_t` bits for the relay's `StreamFlags`
+/// (see [`OsTraceRelayClient::start_trace_with_flags`]).
+pub mod stream_flags {
+    pub const PROCESS_ONLY: u32 = 0x1;
+    pub const SKIP_DECODE: u32 = 0x2;
+    pub const PAYLOAD: u32 = 0x4;
+    pub const HISTORICAL: u32 = 0x8;
+    pub const CALLSTACK: u32 = 0x10;
+    /// Include debug-level messages
+    pub const DEBUG: u32 = 0x20;
+    pub const NO_SENSITIVE: u32 = 0x80;
+    /// Include info-level messages
+    pub const INFO: u32 = 0x100;
+    /// The flags [`super::OsTraceRelayClient::start_trace`] requests
+    pub const DEFAULT: u32 = PAYLOAD | HISTORICAL | CALLSTACK | DEBUG;
+}
+
 /// An initialized client for receiving logs
 #[derive(Debug)]
 pub struct OsTraceRelayReceiver {
@@ -78,9 +95,23 @@ impl OsTraceRelayClient {
     ///
     /// # Arguments
     /// * `pid` - An optional pid to stream logs from
-    pub async fn start_trace(
+    pub async fn start_trace(self, pid: Option<u32>) -> Result<OsTraceRelayReceiver, IdeviceError> {
+        self.start_trace_with_flags(pid, stream_flags::DEFAULT)
+            .await
+    }
+
+    /// Starts the stream of logs from the relay with explicit stream flags.
+    /// The device applies them itself, so leaving out [`stream_flags::DEBUG`]
+    /// and [`stream_flags::INFO`] keeps it from encoding and sending
+    /// lower-level messages at all.
+    ///
+    /// # Arguments
+    /// * `pid` - An optional pid to stream logs from
+    /// * `stream_flags` - A combination of [`stream_flags`] bits
+    pub async fn start_trace_with_flags(
         mut self,
         pid: Option<u32>,
+        stream_flags: u32,
     ) -> Result<OsTraceRelayReceiver, IdeviceError> {
         let pid = match pid {
             Some(p) => p as i64,
@@ -90,7 +121,7 @@ impl OsTraceRelayClient {
             "Request": "StartActivity",
             "Pid": pid,
             "MessageFilter": 65_535,
-            "StreamFlags": 60
+            "StreamFlags": stream_flags
         });
 
         self.idevice.send_bplist(req).await?;
