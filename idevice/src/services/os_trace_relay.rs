@@ -150,6 +150,16 @@ impl OsTraceRelayClient {
 
     /// Get the list of available PIDs
     pub async fn get_pid_list(&mut self) -> Result<Vec<u64>, IdeviceError> {
+        Ok(self
+            .get_processes()
+            .await?
+            .into_iter()
+            .map(|(pid, _)| pid)
+            .collect())
+    }
+
+    /// Get the running processes as `(pid, process name)` pairs
+    pub async fn get_processes(&mut self) -> Result<Vec<(u64, String)>, IdeviceError> {
         let req = crate::plist!({
             "Request": "PidList"
         });
@@ -164,22 +174,28 @@ impl OsTraceRelayClient {
 
         // Device returns { "Payload": { "<pid>": { "ProcessName": "..." }, ... } }
         // where the PIDs are the string keys of the Payload dictionary.
-        if let Some(payload) = res.get("Payload").and_then(|x| x.as_dictionary()) {
-            payload
-                .keys()
-                .map(|k| {
-                    k.parse::<u64>().map_err(|_| {
-                        IdeviceError::UnexpectedResponse(format!(
-                            "PidList Payload key is not a valid PID: {k}"
-                        ))
-                    })
-                })
-                .collect()
-        } else {
-            Err(IdeviceError::UnexpectedResponse(
+        let Some(payload) = res.get("Payload").and_then(|x| x.as_dictionary()) else {
+            return Err(IdeviceError::UnexpectedResponse(
                 "missing Payload dictionary in PidList response".into(),
-            ))
-        }
+            ));
+        };
+        payload
+            .iter()
+            .map(|(k, v)| {
+                let pid = k.parse::<u64>().map_err(|_| {
+                    IdeviceError::UnexpectedResponse(format!(
+                        "PidList Payload key is not a valid PID: {k}"
+                    ))
+                })?;
+                let name = v
+                    .as_dictionary()
+                    .and_then(|d| d.get("ProcessName"))
+                    .and_then(|n| n.as_string())
+                    .unwrap_or_default()
+                    .to_string();
+                Ok((pid, name))
+            })
+            .collect()
     }
 
     /// Create a log archive and write it to the provided writer
