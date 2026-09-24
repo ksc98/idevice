@@ -171,6 +171,11 @@ pub struct Message {
     pub raw_data: Option<Vec<u8>>,
 }
 
+/// Partially received multi-fragment messages, keyed by message identifier
+/// (see [`Message::from_reader_with`]).
+#[derive(Debug, Default)]
+pub struct Fragments(std::collections::HashMap<u32, Vec<u8>>);
+
 impl Aux {
     /// Parses the legacy aux wire format used on iOS 16 and earlier
     ///
@@ -583,9 +588,18 @@ impl Message {
     /// # Errors
     /// * Various IdeviceError variants for IO and parsing failures
     pub async fn from_reader<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Self, IdeviceError> {
-        let mut packet_data: Vec<u8> = Vec::new();
-        // loop for deal with multiple fragments
-        let mheader = loop {
+        Self::from_reader_with(reader, &mut Fragments::default()).await
+    }
+
+    /// Like [`Message::from_reader`], for a reader loop: `fragments` keeps the
+    /// partial multi-fragment messages across calls, since the peer may send
+    /// other messages between the fragments of a large one (a stackshot on one
+    /// channel while another channel streams).
+    pub async fn from_reader_with<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        fragments: &mut Fragments,
+    ) -> Result<Self, IdeviceError> {
+        let (mheader, packet_data) = loop {
             let mut buf = [0u8; 32];
             reader.read_exact(&mut buf).await?;
             let header = MessageHeader {
@@ -609,18 +623,32 @@ impl Message {
                 expects_reply: u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]) == 1,
             };
             if header.fragment_count > 1 && header.fragment_id == 0 {
-                // when reading multiple message fragments, the first fragment contains only a message header.
+                // The first of several fragments is a bare header announcing the total length.
+                fragments.0.insert(
+                    header.identifier,
+                    Vec::with_capacity(header.length as usize),
+                );
                 continue;
             }
             let mut buf = vec![0u8; header.length as usize];
             reader.read_exact(&mut buf).await?;
-            packet_data.extend(buf);
+            if header.fragment_count <= 1 {
+                break (header, buf);
+            }
+            fragments
+                .0
+                .entry(header.identifier)
+                .or_default()
+                .extend(buf);
             if header.fragment_id == header.fragment_count - 1 {
-                break header;
+                let whole = fragments.0.remove(&header.identifier).unwrap_or_default();
+                break (header, whole);
             }
         };
+        let short =
+            || IdeviceError::UnexpectedResponse("DTX payload shorter than its headers".into());
         // read the payload header
-        let buf = &packet_data[0..16];
+        let buf = packet_data.get(0..16).ok_or_else(short)?;
         let pheader = PayloadHeader {
             msg_type: buf[0],
             flags_a: buf[1],
@@ -630,29 +658,36 @@ impl Message {
             total_length: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
             flags: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
         };
+        let aux_end = 16 + pheader.aux_length as usize;
         let aux = if pheader.aux_length > 0 {
-            let buf = packet_data[16..(16 + pheader.aux_length as usize)].to_vec();
+            let buf = packet_data.get(16..aux_end).ok_or_else(short)?.to_vec();
             Some(Aux::from_bytes(buf)?)
         } else {
             None
         };
         // read the data
-        let need_len = (pheader.total_length - pheader.aux_length) as usize;
+        let need_len = pheader
+            .total_length
+            .checked_sub(pheader.aux_length)
+            .ok_or_else(short)? as usize;
         let buf = packet_data
-            [(pheader.aux_length + 16) as usize..pheader.aux_length as usize + 16 + need_len]
+            .get(aux_end..aux_end + need_len)
+            .ok_or_else(short)?
             .to_vec();
         let raw_data = if buf.is_empty() {
             None
         } else {
             Some(buf.clone())
         };
-        let data = if buf.is_empty() {
-            None
-        } else {
+        // Some services stream raw bytes (e.g. kdebug records from
+        // coreprofilesessiontap); only binary plists are archives.
+        let data = if buf.starts_with(b"bplist") {
             Some(
                 ns_keyed_archive::decode::from_bytes(&buf)
                     .map_err(super::errors::DvtError::from)?,
             )
+        } else {
+            None
         };
 
         Ok(Message {
@@ -806,5 +841,76 @@ impl std::fmt::Debug for Message {
             .field("aux", &self.aux)
             .field("data", &self.data.as_ref().map(pretty_print_plist))
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(
+        identifier: u32,
+        fragment_id: u16,
+        fragment_count: u16,
+        length: u32,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend(0x1F3D5B79u32.to_le_bytes());
+        v.extend(32u32.to_le_bytes());
+        v.extend(fragment_id.to_le_bytes());
+        v.extend(fragment_count.to_le_bytes());
+        v.extend(length.to_le_bytes());
+        v.extend(identifier.to_le_bytes());
+        v.extend(1u32.to_le_bytes()); // conversation index (odd: channel as sent)
+        v.extend(5i32.to_le_bytes()); // channel
+        v.extend(0u32.to_le_bytes()); // expects reply
+        v.extend(body);
+        v
+    }
+
+    fn payload(data: &[u8]) -> Vec<u8> {
+        let mut v = vec![2, 0, 0, 0];
+        v.extend(0u32.to_le_bytes()); // aux length
+        v.extend((data.len() as u32).to_le_bytes()); // total length
+        v.extend(0u32.to_le_bytes());
+        v.extend(data);
+        v
+    }
+
+    /// A single-fragment message arriving between the fragments of a large
+    /// one is returned on its own, and the large one is reassembled whole.
+    /// Payloads that are not binary plists come back raw.
+    #[tokio::test]
+    async fn interleaved_fragments_reassemble() {
+        let big = payload(&[0xAB; 100]);
+        let small = payload(&[1, 2, 3, 4]);
+        let mut stream = Vec::new();
+        stream.extend(frame(7, 0, 3, big.len() as u32, &[]));
+        stream.extend(frame(7, 1, 3, 60, &big[..60]));
+        stream.extend(frame(8, 0, 1, small.len() as u32, &small));
+        stream.extend(frame(7, 2, 3, (big.len() - 60) as u32, &big[60..]));
+
+        let mut reader = &stream[..];
+        let mut fragments = Fragments::default();
+        let first = Message::from_reader_with(&mut reader, &mut fragments)
+            .await
+            .unwrap();
+        assert_eq!(first.raw_data.as_deref(), Some(&[1, 2, 3, 4][..]));
+        assert!(first.data.is_none());
+        let second = Message::from_reader_with(&mut reader, &mut fragments)
+            .await
+            .unwrap();
+        assert_eq!(second.raw_data.as_deref(), Some(&[0xAB; 100][..]));
+    }
+
+    /// A payload header claiming more bytes than arrived is an error, not a panic.
+    #[tokio::test]
+    async fn short_payload_is_an_error() {
+        let mut body = payload(&[0; 4]);
+        body[8..12].copy_from_slice(&1000u32.to_le_bytes());
+        let stream = frame(9, 0, 1, body.len() as u32, &body);
+        let mut reader = &stream[..];
+        assert!(Message::from_reader(&mut reader).await.is_err());
     }
 }
